@@ -21,9 +21,10 @@ import (
 )
 
 // govulncheckRun is what the stub replays: real govulncheck v1.3.0 output, cut
-// down (the findings run to one advisory and one renumbered trace, the
-// load-error path made generic), and how that run exited. notInstalled takes
-// govulncheck off PATH instead, as on a machine without it.
+// down (the findings run to one advisory and one renumbered trace, the clean
+// run to its result lines, the load-error path made generic), and how that run
+// exited. notInstalled takes govulncheck off PATH instead, as on a machine
+// without it.
 type govulncheckRun struct {
 	output       string
 	exit         int
@@ -78,8 +79,8 @@ Use '-show verbose' for more details.
 
 // vulnSandbox runs a vulnerability check with stubs first on a PATH that holds
 // nothing else but the system directories, so a real govulncheck cannot leak
-// in, and with a TMPDIR of its own, so the fast scan's cache holds only what
-// this sandbox wrote.
+// in unless it is installed in one of them, and with a TMPDIR of its own, so
+// the fast scan's cache holds only what this sandbox wrote.
 type vulnSandbox struct {
 	t    *testing.T
 	root string
