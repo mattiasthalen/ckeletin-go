@@ -46,29 +46,38 @@ if [[ -f "$CACHE_FILE" ]]; then
     fi
 fi
 
-# Run govulncheck
-# Use -show verbose to get more info, but parse for just the summary
-if run_check "govulncheck ./... 2>&1"; then
-    # No vulnerabilities found
-    date +%s > "$CACHE_FILE"
-    echo "0" > "$CACHE_RESULT"
-    check_success "No vulnerabilities found"
-    exit 0
-else
-    # Check if it's a network error
-    if echo "$CHECK_OUTPUT" | grep -qi "no such host\|connection refused\|timeout\|network is unreachable\|dial tcp"; then
-        echo "  Warning: Vulnerability check skipped (network unavailable)"
-        echo "  Run 'task check:vuln' when online"
-        # Don't cache network errors - retry next time
-        exit 0
-    fi
+# Run govulncheck. Its exit status is the verdict, never its output: findings
+# print call traces, and a symbol such as http2bufferedWriterTimeoutWriter
+# reads like a network error to a text search.
+#   0 = no vulnerability affects the code
+#   3 = vulnerabilities affect the code
+#   anything else = the scan did not complete (vulnerability database
+#   unreachable, packages failed to load)
+GOVULNCHECK_EXIT=0
+run_check "govulncheck ./... 2>&1" || GOVULNCHECK_EXIT=$?
 
-    # Real vulnerabilities found
-    date +%s > "$CACHE_FILE"
-    echo "1" > "$CACHE_RESULT"
-    check_failure \
-        "Security vulnerabilities detected" \
-        "$CHECK_OUTPUT" \
-        "Run: task check:vuln for details"$'\n'"Update vulnerable dependencies before committing"
-    exit 1
-fi
+case $GOVULNCHECK_EXIT in
+    0)
+        date +%s > "$CACHE_FILE"
+        echo "0" > "$CACHE_RESULT"
+        check_success "No vulnerabilities found"
+        exit 0
+        ;;
+    3)
+        date +%s > "$CACHE_FILE"
+        echo "1" > "$CACHE_RESULT"
+        check_failure \
+            "Security vulnerabilities detected" \
+            "$CHECK_OUTPUT" \
+            "Run: task check:vuln for details"$'\n'"Update vulnerable dependencies before committing"
+        exit 1
+        ;;
+    *)
+        # Nothing was scanned, so this cannot pass. Not cached: the next run retries.
+        check_failure \
+            "Vulnerability scan did not complete (govulncheck exit ${GOVULNCHECK_EXIT})" \
+            "$CHECK_OUTPUT" \
+            "Fix the error above and retry"$'\n'"Offline: set SKIP_VULN_CHECK=1 to skip this scan, then run 'task check:vuln' once online"
+        exit 1
+        ;;
+esac

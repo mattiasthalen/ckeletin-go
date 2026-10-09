@@ -21,22 +21,31 @@ fi
 # Check 2: Check for outdated dependencies (non-blocking, just informational)
 OUTDATED_OUTPUT=$(go list -u -m -json all 2>/dev/null | go-mod-outdated -update -direct 2>&1 || true)
 
-# Check 3: Check for vulnerabilities
-if ! run_check "govulncheck ./... 2>&1"; then
-    # Check if it's a network error vs actual vulnerabilities
-    if echo "$CHECK_OUTPUT" | grep -qi "no such host\|connection refused\|timeout\|network is unreachable\|dial tcp"; then
-        check_failure \
-            "Vulnerability check failed (network error)" \
-            "$CHECK_OUTPUT" \
-            "Check internet connection and retry"$'\n'"Alternatively, skip with: SKIP_VULN_CHECK=1 task check"
-        exit 1
-    else
+# Check 3: Check for vulnerabilities. govulncheck's exit status is the verdict,
+# never its output: findings print call traces, and a symbol such as
+# http2bufferedWriterTimeoutWriter reads like a network error to a text search.
+# 0 = no vulnerability affects the code, 3 = vulnerabilities affect the code,
+# anything else = the scan did not complete.
+GOVULNCHECK_EXIT=0
+run_check "govulncheck ./... 2>&1" || GOVULNCHECK_EXIT=$?
+
+case $GOVULNCHECK_EXIT in
+    0)
+        ;;
+    3)
         check_failure \
             "Security vulnerabilities found" \
             "$CHECK_OUTPUT" \
             "Review vulnerabilities and update dependencies"
         exit 1
-    fi
-fi
+        ;;
+    *)
+        check_failure \
+            "Vulnerability scan did not complete (govulncheck exit ${GOVULNCHECK_EXIT})" \
+            "$CHECK_OUTPUT" \
+            "Fix the error above and retry"
+        exit 1
+        ;;
+esac
 
 check_success "All dependencies verified and secure"
