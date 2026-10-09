@@ -20,11 +20,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// govulncheckRun is a recorded govulncheck v1.3.0 run (trimmed) that the stub
-// replays: what it printed and how it exited.
+// govulncheckRun is what the stub replays: real govulncheck v1.3.0 output, cut
+// down (the findings run to one advisory and one renumbered trace, the
+// load-error path made generic), and how that run exited. notInstalled takes
+// govulncheck off PATH instead, as on a machine without it.
 type govulncheckRun struct {
-	output string
-	exit   int
+	output       string
+	exit         int
+	notInstalled bool
 }
 
 var (
@@ -58,6 +61,12 @@ There are errors with the provided package patterns:
 For details on package patterns, see https://pkg.go.dev/cmd/go#hdr-Package_lists_and_patterns.
 `}
 
+	// A usage error (an unknown flag).
+	govulncheckUsage = govulncheckRun{exit: 2, output: "flag provided but not defined: -nosuchflag\n"}
+
+	// govulncheck is not on PATH; the shell exits 127.
+	govulncheckNotInstalled = govulncheckRun{notInstalled: true}
+
 	govulncheckClean = govulncheckRun{exit: 0, output: `=== Symbol Results ===
 
 No vulnerabilities found.
@@ -77,16 +86,17 @@ type vulnSandbox struct {
 	dir  string
 }
 
+// govulncheckStub logs the call, then replays the run the test chose.
+const govulncheckStub = "#!/bin/sh\necho \"$*\" >> \"$FAKE_GOVULNCHECK_CALLS\"\ncat \"$FAKE_GOVULNCHECK_OUTPUT\"\nexit \"$FAKE_GOVULNCHECK_EXIT\"\n"
+
 func newVulnSandbox(t *testing.T) *vulnSandbox {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
 	require.NoError(t, os.MkdirAll(bin, 0o755))
+	// check-deps.sh verifies the modules and lists outdated ones before it
+	// scans; both succeed, so every check-deps.sh case reaches the scan.
 	stubs := map[string]string{
-		// Logs the call, then replays the run the test chose.
-		"govulncheck": "#!/bin/sh\necho \"$*\" >> \"$FAKE_GOVULNCHECK_CALLS\"\ncat \"$FAKE_GOVULNCHECK_OUTPUT\"\nexit \"$FAKE_GOVULNCHECK_EXIT\"\n",
-		// check-deps.sh verifies the modules and lists outdated ones before it
-		// scans; both succeed, so every check-deps.sh case reaches the scan.
 		"go":              "#!/bin/sh\n[ \"$1 $2\" = \"mod verify\" ] && echo \"all modules verified\"\nexit 0\n",
 		"go-mod-outdated": "#!/bin/sh\nexit 0\n",
 	}
@@ -100,6 +110,12 @@ func newVulnSandbox(t *testing.T) *vulnSandbox {
 // extra VAR=value settings, and returns the combined output and exit status.
 func (s *vulnSandbox) run(script string, run govulncheckRun, env ...string) (string, int) {
 	s.t.Helper()
+	stub := filepath.Join(s.dir, "bin", "govulncheck")
+	if run.notInstalled {
+		require.NoError(s.t, os.RemoveAll(stub))
+	} else {
+		require.NoError(s.t, os.WriteFile(stub, []byte(govulncheckStub), 0o755))
+	}
 	output := filepath.Join(s.dir, "govulncheck.out")
 	require.NoError(s.t, os.WriteFile(output, []byte(run.output), 0o644))
 
@@ -134,9 +150,9 @@ func (s *vulnSandbox) scans() int {
 	return strings.Count(string(calls), "\n")
 }
 
-// incompleteScans are govulncheck runs that did not complete: anything but
-// exit 0 (no vulnerability affects the code) or 3 (vulnerabilities do). cause
-// is the part of govulncheck's error a check must show.
+// incompleteScans are govulncheck runs that did not complete. Exits 1, 2 and
+// 127 stand for anything but 0 (no vulnerability affects the code) or 3
+// (vulnerabilities do). cause is the part of the error a check must show.
 var incompleteScans = []struct {
 	name  string
 	run   govulncheckRun
@@ -144,6 +160,8 @@ var incompleteScans = []struct {
 }{
 	{"vulnerability database unreachable", govulncheckOffline, "connection refused"},
 	{"packages fail to load", govulncheckLoadError, "undefined: undefinedFn"},
+	{"usage error", govulncheckUsage, "flag provided but not defined"},
+	{"govulncheck not installed", govulncheckNotInstalled, "command not found"},
 }
 
 // TestFastVulnScanReadsGovulncheckExitStatus pins the pre-commit scan
@@ -174,9 +192,10 @@ func TestFastVulnScanReadsGovulncheckExitStatus(t *testing.T) {
 			assert.Contains(t, out, "SKIP_VULN_CHECK=1", "the offline escape hatch must be named")
 			assert.NotContains(t, out, "Security vulnerabilities")
 
+			scansBefore := s.scans()
 			out, code = s.run("check-vuln-fast.sh", govulncheckClean)
 			assert.Equal(t, 0, code, "the next run must scan again.\nOutput:\n%s", out)
-			assert.Equal(t, 2, s.scans(), "an incomplete scan must not be cached")
+			assert.Equal(t, scansBefore+1, s.scans(), "an incomplete scan must not be cached")
 		})
 	}
 
@@ -213,6 +232,7 @@ func TestDepsCheckReadsGovulncheckExitStatus(t *testing.T) {
 			assert.Contains(t, out, "did not complete")
 			assert.Contains(t, out, tc.cause, "govulncheck's error must be shown")
 			assert.NotContains(t, out, "Security vulnerabilities")
+			assert.NotContains(t, out, "All dependencies verified", "an incomplete scan must not report success")
 		})
 	}
 
